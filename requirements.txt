@@ -1,0 +1,6 @@
+# 归因/可视化脚本依赖 (UniAD/mmdet3d 环境之外另需):
+nuscenes-devkit
+fiftyone
+pandas
+matplotlib
+# 注: 逐帧导出 (patches/) 需在完整 UniAD + mmdetection3d 环境中运行。

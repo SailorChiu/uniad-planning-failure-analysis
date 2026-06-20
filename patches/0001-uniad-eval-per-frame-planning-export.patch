@@ -1,0 +1,181 @@
+From 39005d14e2ba4ed1bd1246e303f807449325eefa Mon Sep 17 00:00:00 2001
+From: Kaifan24 <qhf3512157484@gmail.com>
+Date: Sat, 20 Jun 2026 01:06:03 -0700
+Subject: [PATCH] =?UTF-8?q?Stage1:=20=E5=AF=BC=E5=87=BA=E9=80=90=E5=B8=A7?=
+ =?UTF-8?q?=20planning=20=E6=8C=87=E6=A0=87=E5=88=B0=20CSV?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+为"评测+误差归因"工作台搭建数据底座：在不改变任何全局指标数值的
+前提下，把每帧 planning L2(0.5-3.0s) 与碰撞 flag 落盘成 CSV。
+
+- planning_metrics.py: 新增非破坏性 compute_per_frame()，复用现有
+  L2/碰撞数学，内部 clone 后计算，不碰累加器、不污染输入张量。
+- apis/test.py: eval 主循环逐帧收集 {token, command, L2_*, col_*,
+  col_any}，结尾 rank0 写 CSV（新增 planning_csv 参数，单 GPU 假设）。
+- tools/test.py: 新增 --planning-csv，默认落到 --out 同目录。
+
+验证(mini, 81帧): CSV 各 L2_* 列均值逐位等于全局 PrettyTable 的 L2
+行 -> 证明逐帧计算与累加路径一致、全局指标未变。
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ projects/mmdet3d_plugin/uniad/apis/test.py    | 51 ++++++++++++++++++-
+ .../planning_head_plugin/planning_metrics.py  | 29 ++++++++++-
+ tools/test.py                                 |  9 +++-
+ 3 files changed, 85 insertions(+), 4 deletions(-)
+
+diff --git a/projects/mmdet3d_plugin/uniad/apis/test.py b/projects/mmdet3d_plugin/uniad/apis/test.py
+index 72445e8..c075db4 100644
+--- a/projects/mmdet3d_plugin/uniad/apis/test.py
++++ b/projects/mmdet3d_plugin/uniad/apis/test.py
+@@ -37,7 +37,8 @@ def custom_encode_mask_results(mask_results):
+                         dtype='uint8'))[0])  # encoded with RLE
+     return [encoded_mask_results]
+ 
+-def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
++def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False,
++                          planning_csv=None):
+     """Test model with multiple gpus.
+     This method tests model with multiple gpus and collects the results
+     under two different modes: gpu and cpu modes. By setting 'gpu_collect=True'
+@@ -75,7 +76,9 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
+                       and model.module.with_planning_head
+     if eval_planning:
+         planning_metrics = PlanningMetric().cuda()
+-        
++        # Stage-1 误差归因: per-frame planning rows -> CSV
++        planning_rows = []
++
+     bbox_results = []
+     mask_results = []
+     dataset = data_loader.dataset
+@@ -99,6 +102,37 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
+                 result[0]['planning_traj'] = result[0]['planning']['result_planning']['sdc_traj']
+                 result[0]['planning_traj_gt'] = result[0]['planning']['planning_gt']['sdc_planning']
+                 result[0]['command'] = result[0]['planning']['planning_gt']['command']
++                # Per-frame export BEFORE the accumulating call below: that call
++                # negates x in place on these tensors (basic slicing -> view),
++                # so compute it first while values are still original.
++                per_frame_L2, per_frame_col = planning_metrics.compute_per_frame(
++                    pred_sdc_traj[:, :6, :2], sdc_planning[0][0, :, :6, :2],
++                    sdc_planning_mask[0][0, :, :6, :2], segmentation[0][:, [1, 2, 3, 4, 5, 6]])
++                l2 = per_frame_L2[0].detach().cpu().numpy()          # (6,) at 0.5..3.0s
++                col = per_frame_col.detach().cpu().numpy()           # (6,) box-collision 0/1
++                # command is a list[torch.Tensor] (possibly nested); unwrap to a scalar int
++                cmd = result[0]['command']
++                try:
++                    while isinstance(cmd, (list, tuple)):
++                        cmd = cmd[0]
++                    if isinstance(cmd, torch.Tensor):
++                        cmd = int(cmd.flatten()[0].item())
++                    else:
++                        cmd = int(np.asarray(cmd).flatten()[0])
++                except Exception:
++                    cmd = -1
++                planning_rows.append({
++                    'token': result[0].get('token', ''),
++                    'command': cmd,
++                    'L2_0.5': float(l2[0]), 'L2_1.0': float(l2[1]), 'L2_1.5': float(l2[2]),
++                    'L2_2.0': float(l2[3]), 'L2_2.5': float(l2[4]), 'L2_3.0': float(l2[5]),
++                    # uniad strategy (config planning_evaluation_strategy="uniad"):
++                    # instantaneous L2 at 1s/2s/3s -> indices 1/3/5
++                    'l2_1s': float(l2[1]), 'l2_2s': float(l2[3]), 'l2_3s': float(l2[5]),
++                    'col_0.5': int(col[0]), 'col_1.0': int(col[1]), 'col_1.5': int(col[2]),
++                    'col_2.0': int(col[3]), 'col_2.5': int(col[4]), 'col_3.0': int(col[5]),
++                    'col_any': int((col > 0).any()),
++                })
+                 planning_metrics(pred_sdc_traj[:, :6, :2], sdc_planning[0][0,:, :6, :2], sdc_planning_mask[0][0,:, :6, :2], segmentation[0][:, [1,2,3,4,5,6]])
+ 
+             # Eval Occ
+@@ -162,6 +196,19 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
+     if eval_planning:
+         planning_results = planning_metrics.compute()
+         planning_metrics.reset()
++        # Dump per-frame planning rows to CSV (rank 0 only).
++        # NOTE: assumes single-GPU eval (the 4060 setup): each rank only holds
++        # its own shard, so under true multi-GPU this writes rank-0's frames
++        # only. Gather across ranks here if multi-GPU export is ever needed.
++        if rank == 0 and planning_csv is not None and len(planning_rows) > 0:
++            import csv
++            mmcv.mkdir_or_exist(osp.dirname(osp.abspath(planning_csv)))
++            fieldnames = list(planning_rows[0].keys())
++            with open(planning_csv, 'w', newline='') as f:
++                writer = csv.DictWriter(f, fieldnames=fieldnames)
++                writer.writeheader()
++                writer.writerows(planning_rows)
++            print(f'\n[Stage-1] wrote {len(planning_rows)} per-frame planning rows to {planning_csv}')
+ 
+     ret_results = dict()
+     ret_results['bbox_results'] = bbox_results
+diff --git a/projects/mmdet3d_plugin/uniad/dense_heads/planning_head_plugin/planning_metrics.py b/projects/mmdet3d_plugin/uniad/dense_heads/planning_head_plugin/planning_metrics.py
+index 30ca2b5..7303bca 100644
+--- a/projects/mmdet3d_plugin/uniad/dense_heads/planning_head_plugin/planning_metrics.py
++++ b/projects/mmdet3d_plugin/uniad/dense_heads/planning_head_plugin/planning_metrics.py
+@@ -146,4 +146,31 @@ class PlanningMetric(Metric):
+             'obj_col': self.obj_col / self.total,
+             'obj_box_col': self.obj_box_col / self.total,
+             'L2' : self.L2 / self.total
+-        }
+\ No newline at end of file
++        }
++
++    def compute_per_frame(self, trajs, gt_trajs, gt_trajs_mask, segmentation):
++        '''
++        Non-destructive per-frame metric for the Stage-1 误差归因 export.
++        Mirrors the math in `update()` but returns this single sample's
++        per-timestep L2 / collision WITHOUT touching the running accumulators
++        and WITHOUT mutating the caller's tensors (update() negates x in place
++        via a view, which would corrupt the global metric if reused here).
++
++        trajs:         torch.Tensor (B, n_future, 2/3)
++        gt_trajs:      torch.Tensor (B, n_future, 2/3)
++        gt_trajs_mask: torch.Tensor (B, n_future, 2)
++        segmentation:  torch.Tensor (B, n_future, 200, 200)
++
++        Returns:
++            L2:       torch.Tensor (B, n_future)  per-timestep L2 error
++            box_coll: torch.Tensor (n_future,)    per-timestep box-collision count
++                      (0/1 per step for B=1, the value reported as obj_box_col)
++        '''
++        trajs = trajs.clone()
++        gt_trajs = gt_trajs.clone()
++        trajs[..., 0] = - trajs[..., 0]
++        gt_trajs[..., 0] = - gt_trajs[..., 0]
++        L2 = self.compute_L2(trajs, gt_trajs, gt_trajs_mask)
++        _, obj_box_coll_sum = self.evaluate_coll(
++            trajs[:, :, :2], gt_trajs[:, :, :2], segmentation)
++        return L2, obj_box_coll_sum
+\ No newline at end of file
+diff --git a/tools/test.py b/tools/test.py
+index c370a49..08ea6f9 100755
+--- a/tools/test.py
++++ b/tools/test.py
+@@ -29,6 +29,9 @@ def parse_args():
+     parser.add_argument('config', help='test config file path')
+     parser.add_argument('checkpoint', help='checkpoint file')
+     parser.add_argument('--out', default='output/results.pkl', help='output result file in pickle format')
++    parser.add_argument('--planning-csv', default=None,
++                        help='path to dump per-frame planning metrics (L2/collision) as CSV. '
++                             'If omitted, defaults to planning_per_frame.csv next to --out.')
+     parser.add_argument(
+         '--fuse-conv-bn',
+         action='store_true',
+@@ -228,8 +231,12 @@ def main():
+             model.cuda(),
+             device_ids=[torch.cuda.current_device()],
+             broadcast_buffers=False)
++        planning_csv = args.planning_csv
++        if planning_csv is None and args.out is not None:
++            planning_csv = osp.join(osp.dirname(osp.abspath(args.out)),
++                                    'planning_per_frame.csv')
+         outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
+-                                        args.gpu_collect)
++                                        args.gpu_collect, planning_csv=planning_csv)
+ 
+     rank, _ = get_dist_info()
+     if rank == 0:
+-- 
+2.43.0
+
