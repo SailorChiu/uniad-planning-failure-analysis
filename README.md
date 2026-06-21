@@ -66,6 +66,40 @@ worst-9 失效帧（CAM_FRONT）：#1–7 是路口，#8–9 才是直路。
 方向性结论与 **VADv2（概率式规划）/ GenAD（生成式多模态）** 的改进动机一致 ——
 即用多模态/分布式规划替代单点回归来吸收路口处的未来不确定性。
 
+## 语义归因扩展(VLM,诚实负结果)
+
+在上面的**几何归因**(地图 `is_intersection` 客观标签)之上,再加一层**语义归因**:
+对同一批 worst-K 难例,用开源 VLM(**Qwen2-VL-2B-Instruct**,fp16)看三路前视相机,强制输出结构化 JSON
+(场景描述 / 是否路口 / 关键障碍 / 为什么难 / 建议 meta-action)。**关键设计**:把 VLM 判的
+`is_intersection` 对照地图真值,把"主观解释"变成一个可算召回/一致率的客观实验 —— 即把 VLM 也纳入同一套评测框架。
+
+| 步骤 | 工具 | 产物 |
+|------|------|------|
+| ⑤ VLM 语义归因 | `tools/vlm_hardcase_attribution.py` | `vlm_attribution.csv` + `vlm_fields.json` |
+| ⑥ VLM 难例浏览器 | `tools/fiftyone_vlm_hardcases.py` | 三路前视 grouped dataset(`map/vlm is_intersection`、`intersection_mismatch` 字段) |
+
+**结果(诚实记录,负结果)**:worst-15 里地图标了 **8 帧路口**,Qwen2-VL-2B 零样本**全部判 False**
+(路口召回 **0%**),且 15 帧 `meta_action` 全塌成 `keep_lane`。表面 **46.7%** 的"一致率"只是非路口帧的
+**基率假象**,不可当准确率汇报。
+
+**怎么读 / 下一步**:小 VLM 零样本在难例上发生**输出塌缩 + 任务定义错位**(地图 `is_intersection` 是拓扑标签,
+未必在前视里可见)。实证结论:要么上更大模型 / 微调(Qwen2.5-VL-7B 4bit 待验),要么改评测设计
+(多相机输入 / 更贴视觉的定义)。**真正的交付物是"VLM 接入评测闭环 + 可视化归因"这条工程链路,而非那个 0% 数字本身。**
+完整记录见 [`docs/VLM_HARDCASE_ATTRIBUTION.md`](docs/VLM_HARDCASE_ATTRIBUTION.md)。
+
+```bash
+# 前置:已有 output/planning_per_frame_attr.csv(label_scene_attribution.py 产物,含 is_intersection)
+# VLM 依赖独立于 UniAD 主环境,建议干净 venv:pip install -r requirements-vlm.txt
+python tools/vlm_hardcase_attribution.py \
+    --metrics-csv output/planning_per_frame_attr.csv \
+    --dataroot data/nuscenes --version v1.0-mini --topk 15 \
+    --model Qwen/Qwen2-VL-2B-Instruct \
+    --cameras CAM_FRONT_LEFT CAM_FRONT CAM_FRONT_RIGHT \
+    --out-csv output/vlm_attribution.csv --fiftyone-json output/vlm_fields.json
+# 可视化:三路前视 + map/vlm 路口标签 + 不一致高亮
+python tools/fiftyone_vlm_hardcases.py --csv output/vlm_attribution.csv   # 浏览 http://localhost:5151
+```
+
 ## 运行说明
 
 依赖：`mmdet3d` + UniAD 环境、`nuscenes-devkit`、`fiftyone`、`pandas`、`matplotlib`。
@@ -93,7 +127,8 @@ fiftyone app launch uniad_hard_cases --port 5151   # 浏览 http://localhost:515
 ## 技术栈
 
 `UniAD` / `BEVFormer` · `mmdetection3d` · `PyTorch` · `nuScenes-devkit`（map API 路口判定）·
-`FiftyOne`（多相机 grouped dataset 难例浏览器）· `pandas` / `matplotlib`（归因统计与可视化）
+`FiftyOne`（多相机 grouped dataset 难例浏览器）· `pandas` / `matplotlib`（归因统计与可视化）·
+`Qwen2-VL` / `transformers`（难例语义归因 VLM，纳入可度量评测）
 
 ## 诚实标注 / 边界
 

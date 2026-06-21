@@ -1,0 +1,10 @@
+# VLM 语义归因(tools/vlm_hardcase_attribution.py)的依赖。
+# 独立于 UniAD 主环境,建议在干净 venv 里跑,避免污染 uniad2.0。
+# torch 请按本机 CUDA 版本单独安装(4060 8G 用 fp16 跑 2B/3B 模型即可)。
+transformers>=4.45
+accelerate
+qwen-vl-utils
+pillow
+pandas
+nuscenes-devkit
+fiftyone
